@@ -1,0 +1,11 @@
+[Unit]
+Description=Enable firewall rules after Docker containers are started
+Type=oneshot
+After=docker.service
+RemainAfterExit=yes
+
+[Service]
+ExecStart=/etc/init.d/firewall
+
+[Install]
+WantedBy=default.target
