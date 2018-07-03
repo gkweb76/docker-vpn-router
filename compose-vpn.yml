@@ -1,0 +1,134 @@
+# Title : Compose file to setup a ProtonVPN home gateway, along with DNScrypt and Unbound
+# Date : 03/07/2018
+# Version : v1.0
+# Command : sudo docker-compose -f compose-vpn.yml -p <project_name> up
+version: "3.5"
+
+services:
+  # OpenVPN ---------------------------------------------------------------------------
+  openvpn:
+    image: gkweb76/openvpn:2.4.4
+    container_name: openvpn
+    read_only: yes
+    networks:
+      openvpn:
+        ipv4_address: ${IP_OPENVPN}
+    dns: ${HOST_IP_ADDRESS} # We use unbound listening on the host interface, leading to dnscrypt
+    cap_add: # add capabilities
+      - NET_ADMIN
+    devices: # create /dev/net/tun inside container
+      - /dev/net/tun
+    sysctls: # update container /etc/sysctl.conf
+      net.ipv4.ip_forward: 1
+    volumes:
+      - openvpn:/etc/openvpn # stored as /var/lib/docker/volumes/<project_name>_openvpn
+      - /etc/localtime:/etc/localtime:ro # keep container clock in sync with host
+    tmpfs:
+      - /tmp
+    restart: "unless-stopped"
+    depends_on:
+      - unbound
+
+  # DNScrypt-proxy1 -------------------------------------------------------------------
+  dnscrypt1:
+    image: gkweb76/dnscrypt-proxy:1.9.5
+    container_name: dnscrypt-proxy1
+    read_only: yes
+    environment:
+      - LOCAL_IP=0.0.0.0 # host IP
+      - LOCAL_PORT=53 # container port
+      - SERVER=${RESOLVER_DNSCRYPT1}
+    networks:
+      dnscrypt:
+        ipv4_address: ${IP_DNSCRYPT1}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro # keep container clock in sync with host
+    restart: "unless-stopped"
+
+   # DNScrypt-proxy2 -------------------------------------------------------------------
+  dnscrypt2:
+    image: gkweb76/dnscrypt-proxy:1.9.5
+    container_name: dnscrypt-proxy2
+    read_only: yes
+    environment:
+      - LOCAL_IP=0.0.0.0 # host IP
+      - LOCAL_PORT=53 # container port
+      - SERVER=${RESOLVER_DNSCRYPT2}
+    networks:
+      dnscrypt:
+        ipv4_address: ${IP_DNSCRYPT2}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro # keep container clock in sync with host
+    restart: "unless-stopped"
+
+  # DNScrypt-proxy3 -------------------------------------------------------------------
+  dnscrypt3:
+    image: gkweb76/dnscrypt-proxy:1.9.5
+    container_name: dnscrypt-proxy3
+    read_only: yes
+    environment:
+      - LOCAL_IP=0.0.0.0 # host IP
+      - LOCAL_PORT=53 # container port
+      - SERVER=${RESOLVER_DNSCRYPT3}
+    networks:
+      dnscrypt:
+        ipv4_address: ${IP_DNSCRYPT3}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro # keep container clock in sync with host
+    restart: "unless-stopped"
+
+   # Unbound ---------------------------------------------------------------------------
+  unbound:
+    image: gkweb76/unbound:1.6.7
+    container_name: unbound
+    read_only: yes
+    ports: # host_ip:host_port:container_port
+      - "${HOST_IP_ADDRESS}:53:53/udp"
+      - "${HOST_IP_ADDRESS}:53:53/tcp"
+    networks:
+      dnscrypt:
+        ipv4_address: ${IP_UNBOUND}
+    volumes:
+      - unbound:/etc/unbound # stored as /var/lib/docker/volumes/<project_name>_unbound
+      - /etc/localtime:/etc/localtime:ro # keep container clock in sync with host
+    restart: "unless-stopped"
+    depends_on:
+      - dnscrypt1
+
+   # DHCP ---------------------------------------------------------------------------
+  dhcp:
+    image: gkweb76/dhcp:4.3.5
+    container_name: dhcp
+    read_only: yes
+    ports: # host_port
+      - 67/udp
+    network_mode: "host" # listen to lan broadcast (dhcp request)
+    userns_mode: "host" # user namespace isolation is not compatible with host network mode
+    volumes:
+      - dhcp:/etc/dhcp # stored as /var/lib/docker/volumes/<project_name>_dhcp
+      - dhcp_leases:/var/lib/dhcp
+      - /etc/localtime:/etc/localtime:ro # keep container clock in sync with host
+    tmpfs:
+      - /run/dhcp # to allow dhcp daemon to create its PID file
+    command: ["/usr/sbin/dhcpd", "-4", "-d", "-cf", "/etc/dhcp/dhcpd.conf", "${HOST_LAN_INTERFACE}"] # specify your host LAN interface
+    restart: "unless-stopped"
+
+# Networks declaration
+networks:
+  dnscrypt:
+    ipam:
+      driver: default
+      config:
+        - subnet: ${NET_DNSCRYPT}
+  openvpn:
+    ipam:
+      driver: default
+      config:
+        - subnet: ${NET_OPENVPN}
+
+# Volumes declaration
+volumes:
+  openvpn:
+  unbound:
+  dhcp:
+  dhcp_leases:
