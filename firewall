@@ -1,0 +1,294 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          firewall rules
+# Required-Start:    $all
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: enable firewall rules
+### END INIT INFO
+
+# Date : May 30 2018
+# Author : Guillaume Kaddouch
+# URL : http://networkfilter.blogspot.com
+# Version : 1.0
+
+# Iptables script for a home gateway router with Docker, using OpenVPN, Unbound, DNSCrypt, and DHCP.
+
+######################################################################
+# VARIABLES
+######################################################################
+lan="enp2s0"                            # must modify (your LAN interface)
+egress="enp4s0"                         # must modify (your OUT/Internet interface)
+myself="10.0.0.1"                       # must modify (your LAN IP address)
+myself_egress="192.168.1.2"             # must modify (your OUT IP address)
+egress_network="192.168.1.0/24"         # must modify (network between your router and ISP router)
+egress_broadcast="192.168.1.255"        # must modify (brodcast address of previous network)
+lan_network="10.0.0.0/24"               # must modify (your LAN network)
+lan_broadcast="10.0.0.255"              # must modify (your LAN broadcast address)
+docker="docker0"
+openvpn_port="1194"
+openvpn_proto="udp"
+vpn_network="10.8.8.0/24"
+
+# Description : below we are populating variables based on dynamic data, such as the Docker bridge host interface name (br-xxxxx)
+# or the networks or containers names assigned by Docker. For instance, if your container name is 'foo', after using compose
+# with a project name of 'gkweb76', your container name will be 'gkweb76_foo'.
+# For this to work, your 'dnscrypt' container name must contain 'dnscrypt' word, and same for the others.
+
+function echo_error { # light red
+        echo -e "\033[91m[!]\033[0m $1"
+}
+
+function echo_info { # white
+        echo -e "\033[97m$1\033[0m"
+}
+
+function echo_success { # green
+        echo -e "\033[32m[+]\033[0m $1"
+}
+
+clear
+echo_info "NETWORK"
+echo "[*] LAN:  $lan ($myself)"
+echo "[*] egress: $egress ($myself_egress)"
+
+echo ""
+echo_info "DOCKER"
+dnscrypt_exists=`docker container ls | grep unbound | wc -l`
+if [ $dnscrypt_exists -gt 0 ]; then
+        # Docker dnscrypt & unbound
+        echo_success "dnscrypt container found"
+        docker_command=`docker network ls | grep dnscrypt | cut -d' ' -f1`
+        docker_dnscrypt_if="br-$docker_command"
+        echo "[*] Docker dnscrypt interface is $docker_dnscrypt_if"
+
+        docker_dnscrypt_name=`docker network ls | grep dnscrypt | cut -d' ' -f9`
+        docker_dnscrypt_network=`docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' $docker_dnscrypt_name`
+        echo "[*] Docker dnscrypt network is $docker_dnscrypt_network"
+
+        docker_dnscrypt_gateway=`docker container inspect --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' dnscrypt-proxy1`
+        echo "[*] Docker dnscrypt gateway is $docker_dnscrypt_gateway"
+else
+        echo_error "Docker dnscrypt container not found"
+fi
+
+openvpn_exists=`docker container ls | grep openvpn | wc -l`
+if [ $openvpn_exists -gt 0 ]; then
+        # Docker openvpn
+        echo ""
+        echo_success "openvpn container found"
+        docker_command=`docker network ls | grep openvpn | cut -d' ' -f1`
+        docker_openvpn_if="br-$docker_command"
+        echo "[*] Docker openvpn interface is $docker_openvpn_if"
+
+        docker_openvpn_name=`docker network ls | grep openvpn | cut -d' ' -f9`
+        docker_openvpn_network=`docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' $docker_openvpn_name`
+        echo "[*] Docker openvpn network is $docker_openvpn_network"
+
+        container_openvpn=`docker container inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' openvpn`
+        echo "[*] Docker openvpn IP is $container_openvpn"
+
+        docker_openvpn_gateway=`docker container inspect --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' openvpn`
+        echo "[*] Docker openvpn gateway is $docker_openvpn_gateway"
+else
+        echo_error "Docker openvpn container not found"
+fi
+
+unbound_exists=`docker container ls | grep unbound | wc -l`
+if [ $unbound_exists -gt 0 ]; then
+        echo ""
+        echo_success "unbound container found"
+        container_unbound=`docker container inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' unbound`
+        echo "[*] Docker unbound IP is $container_unbound"
+else
+        echo_error "Docker unbound container not found"
+fi
+
+######################################################################
+# FLUSHING CHAINS & RULES, CUSTOM CHAINS
+######################################################################
+# Description : below we flush any existing configuration and we create our custom chains
+
+# Flush all
+iptables -t filter -F
+iptables -t filter -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t mangle -F
+iptables -t mangle -X
+
+# Create customs chains
+iptables -N LOG_DROP_IN
+iptables -N LOG_DROP_OUT
+iptables -N LOG_DROP_FWD
+
+# Populate our custom chains
+iptables -A LOG_DROP_IN -j LOG --log-prefix "[IPTABLES DROP IN] "
+iptables -A LOG_DROP_IN -j DROP
+iptables -A LOG_DROP_OUT -j LOG --log-prefix "[IPTABLES DROP OUT] "
+iptables -A LOG_DROP_OUT -j DROP
+iptables -A LOG_DROP_FWD -j LOG --log-prefix "[IPTABLES DROP FWD] "
+iptables -A LOG_DROP_FWD -j DROP
+
+if [ $openvpn_exists -gt 0 ]; then
+        echo ""
+        echo_info "ROUTING"
+        # Traffic flow that will get redirected to our custom route table later.
+        # Here, inbound traffic to LAN interface (iif) destinated to non local destination
+        rule="iif $lan table openvpn"
+
+        # Flush our openvpn routing table
+        ip route flush table openvpn
+        ip rule del $rule
+fi
+
+######################################################################
+# DEFAULT POLICIES
+######################################################################
+# Description : below we set our default policies. Mainly we want to drop by default, to not filter loopback, and
+# to use stateful inspection to allow packets belonging to existing network flow
+
+# Drop all by default
+iptables -P INPUT DROP
+iptables -P OUTPUT DROP
+iptables -P FORWARD DROP
+
+# Loopback traffic allowed
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow existing connections
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+######################################################################
+# POLICY BASED ROUTING
+######################################################################
+# Description : below we want to match packets from the lan directed at the Internet and redirect them to our OpenVPN Docker container
+# 1 - we want to create a dedicated routing table for these packets
+# 2 - we want to send these packets to this routing table
+
+if [ $openvpn_exists -gt 0 ]; then
+        # Creating openvpn table routes
+        ip route add default via $container_openvpn dev $docker_openvpn_if table openvpn
+
+        # Sending rule matching packets into openvpn route table
+        # reminder : ip rule add iif $lan table openvpn
+        ip rule add $rule
+
+        # Display openvpn table routes
+        iproute_command=`ip route list table 1`
+        echo "[*] Openvpn table created: "
+        echo "$iproute_command"
+fi
+
+######################################################################
+# FORWARDING & NAT
+######################################################################
+# Description : below are all NAT and FORWARD rules. Keep in mind that packets coming to this router and which are destinated
+# to the Internet will never match INPUT neither OUTPUT chains, they will only go through the FORWARD chain.
+# Also, with some Docker containers being in their own networks and having their own interfaces, going to the host will also be forwarded.
+
+# NAT outbound traffic from VPN interface
+iptables -t nat -A POSTROUTING -o $egress -j MASQUERADE
+
+if [ $openvpn_exists -gt 0 ]; then
+        # Allow LAN traffic going through VPN
+        iptables -A FORWARD -i $lan -o $docker_openvpn_if -s $lan_network -j ACCEPT
+
+        # Allow Openvpn container to establish VPN connections
+        iptables -A FORWARD -i $docker_openvpn_if -o $egress -p $openvpn_proto -s $container_openvpn --dport $openvpn_port -m conntrack --ctstate NEW -j ACCEPT
+fi
+
+if [ $dnscrypt_exists -gt 0 ]; then
+        # Allow DNSCrypt requests from dnscrypt containers
+        iptables -A FORWARD -i $docker_dnscrypt_if -o $egress -p udp -s $docker_dnscrypt_network -m multiport --dports 443,5353 -m conntrack --ctstate NEW -j ACCEPT
+        iptables -A FORWARD -i $docker_dnscrypt_if -o $egress -p tcp -s $docker_dnscrypt_network -m multiport --dports 443,5353 -m conntrack --ctstate NEW -j ACCEPT
+
+        # Allow Unbound to request DNSCrypt containers
+        iptables -A FORWARD -i $docker_dnscrypt_if -o $docker_dnscrypt_if -p udp -s $container_unbound --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+        iptables -A FORWARD -i $docker_dnscrypt_if -o $docker_dnscrypt_if -p tcp -s $container_unbound --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+
+fi
+
+# Redirect LAN DNS requests sent to external servers to local unbound instead (prevent DNS leak)
+# 'REDIRECT' without any option implies to redirect to our local IP address and to keep the same destination port
+# example : from lan to 8.8.8.8:53 (google dns) becomes -> to routeur(myself):53
+iptables -t nat -A PREROUTING -i $lan -p udp -s $lan_network ! -d $myself --dport 53 -j REDIRECT
+
+# Allow default docker0 bridge interface (required if you want to run temporary containers images directly from Docker Hub)
+iptables -A FORWARD -i $docker -o $egress -m conntrack --ctstate NEW -j ACCEPT
+
+######################################################################
+# RULES
+######################################################################
+# Description : below are all of the remaining Inbound and Outbound rules. Ultimately, LOG all dropped packets.
+
+# INPUT #
+
+# Allow SSH connections
+iptables -A INPUT -i $lan -p tcp -s $lan_network -d $myself --dport 22 -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow DNS requests
+iptables -A INPUT -i $lan -p udp -s $lan_network -d $myself --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+iptables -A INPUT -i $lan -p tcp -s $lan_network -d $myself --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow DHCP requests
+iptables -A INPUT -i $lan -p udp --sport 67:68 --dport 67:68 -m addrtype --dst-type BROADCAST -j ACCEPT
+
+if [ $openvpn_exists -gt 0 ]; then
+        # Allow openvpn container to reach host DNS service
+        iptables -A INPUT -p udp -i $docker_openvpn_if -s $container_openvpn -d $myself --dport 53 -j ACCEPT
+fi
+
+if [ $dnscrypt_exists -gt 0 ]; then
+        # Allow dnscrypt containers to request unbound on the host
+        iptables -A INPUT -p udp -i $docker_dnscrypt_if -s $docker_dnscrypt_network -d $myself --dport 53 -j ACCEPT
+        iptables -A INPUT -p tcp -i $docker_dnscrypt_if -s $docker_dnscrypt_network -d $myself --dport 53 -j ACCEPT
+        iptables -A INPUT -p udp -i $docker_dnscrypt_if -s $docker_dnscrypt_network -d $docker_dnscrypt_gateway --sport 53 -j ACCEPT
+        iptables -A INPUT -p tcp -i $docker_dnscrypt_if -s $docker_dnscrypt_network -d $docker_dnscrypt_gateway --sport 53 -j ACCEPT
+fi
+
+# Allow default docker0 bridge interface (required if you want to run temporary containers images directly from Docker Hub)
+iptables -A INPUT -i $docker -m conntrack --ctstate NEW -j ACCEPT
+
+
+# OUTPUT #
+
+# Allow NTP requests
+iptables -A OUTPUT -o $egress -p udp -s $myself_egress --dport 123 -m conntrack --ctstate NEW -j ACCEPT
+
+if [ $dnscrypt_exists -gt 0 ]; then
+        # Allow DNS requests to be sent to Unbound container
+        iptables -A OUTPUT -o $docker_dnscrypt_if -p udp -s $docker_dnscrypt_gateway -d $container_unbound --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+else
+        # Allow router to send DNS requests on the Internet
+        echo_info "Loading outbound DNS rules"
+        iptables -A OUTPUT -o $egress -p udp -s $myself_egress --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+        iptables -A OUTPUT -o $egress -p tcp -s $myself_egress --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+fi
+
+# Enable Docker login to push images
+iptables -A OUTPUT -o $egress -p tcp -s $myself_egress --dport 443 -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow our router to retrieve updates and packages
+iptables -A OUTPUT -o $egress -p tcp -s $myself_egress --dport 80 -m conntrack --ctstate NEW -j ACCEPT
+
+
+
+# LOG AND DROP #
+
+# Do not log broadcast traffic
+iptables -A INPUT -d $lan_broadcast -j DROP
+iptables -A INPUT -d $egress_broadcast -j DROP
+iptables -A INPUT -d "255.255.255.255" -j DROP
+
+# Log everything else. View with 'tail -f /var/log/syslog | grep IPTABLES'
+iptables -A INPUT -j LOG_DROP_IN
+iptables -A OUTPUT -j LOG_DROP_OUT
+iptables -A FORWARD -j LOG_DROP_FWD
+
+echo ""
+echo "[*] Done."
